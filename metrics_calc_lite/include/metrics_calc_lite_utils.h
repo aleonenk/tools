@@ -38,17 +38,33 @@
 #include <algorithm>
 
 //#define NO_IPP
+//#define NO_MSDK
 
 #ifndef NO_IPP
 #include "ipp.h"
 #endif
 
+#ifndef NO_MSDK
+#include "mfxdefs.h"
+#include "mfxstructures.h"
+#include "mfxvideo++.h"
+#endif
+
 typedef enum {
-    MCL_ERR_NONE          =  0,
-    MCL_ERR_UNKNOWN       = -1,
-    MCL_ERR_NULL_PTR      = -2,
-    MCL_ERR_INVALID_PARAM = -3,
-    MCL_ERR_MEMORY_ALLOC  = -4
+    MCL_ERR_NONE                    =   0,
+    MCL_ERR_WRONG_OPTIONS           =  -1,
+    MCL_ERR_EMPTY_METRICSET         =  -2,
+    MCL_ERR_VIDEO1_FAIL             =  -3,
+    MCL_ERR_VIDEO2_FAIL             =  -4,
+    MCL_ERR_METRIC_FAIL             =  -5,
+    MCL_ERR_FILE_IO_FAIL            =  -6,
+    MCL_ERR_UNSUPPORTED_VIDEO       =  -7,
+    MCL_ERR_INCOMPATIBLE_VIDEO      =  -8,
+    MCL_ERR_INCOMPATIBLE_OPTIONS    =  -9,
+    MCL_ERR_MEMORY_ALLOC            = -10,
+    MCL_ERR_NULL_PTR                = -11,
+    MCL_ERR_INVALID_PARAM           = -12,
+    MCL_ERR_UNKNOWN                 = -13, // must be last error
 } EErrorStatus;
 
 typedef enum {
@@ -57,10 +73,12 @@ typedef enum {
     YUY2P, YUY2I, NV16P, NV16I, I422P, I422I,                             // 4:2:2
     AYUVP, AYUVI, Y410P, Y410I, I444P, I444I, I410P, I410I, Y416P, Y416I, // 4:4:4
     RGB32I, RGB32P, A2RGB10I, A2RGB10P, ARGB16P                           // R:G:B
+#ifndef NO_MSDK
+    ,VIDEO
+#endif
 } ESequenceType;
 
 typedef enum { C420, C422, C444 } EChromaType;
-typedef enum { D008, D010, D012, D016 } EBitDepth;
 
 #ifdef NO_IPP
 typedef struct {
@@ -95,7 +113,7 @@ uint64_t _file_fseek(FILE *fd, int64_t position, int32_t mode);
 uint64_t _file_ftell(FILE *fd);
 
 /* Memory allocation/deletion */
-uint8_t* mclMalloc(uint32_t size, EBitDepth bd);
+uint8_t* mclMalloc(uint32_t size, uint32_t bd);
 float* mclMalloc_32f_C1(int32_t widthPixels, int32_t heightPixels, int32_t* pStepBytes);
 #ifdef NO_IPP
 #define mclFree(ptr) if (ptr) delete[] ptr; ptr = NULL;
@@ -104,20 +122,20 @@ float* mclMalloc_32f_C1(int32_t widthPixels, int32_t heightPixels, int32_t* pSte
 #endif
 
 /* Packed to planar formats conversions */
-EErrorStatus mclYCbCr420ToYCrCb420_P2P3R(const uint8_t* pSrcY, int32_t srcYStep, const uint8_t* pSrcUV, int32_t srcUVStep, uint8_t* PDst[3], int32_t dstStep[3], ImageSize roiSize, EBitDepth bd);
-EErrorStatus mclYCbCr422_C2P3R(uint8_t* pSrc, int32_t srcStep, uint8_t* pDst[3], int32_t dstStep[3], ImageSize roiSize, EBitDepth bd);
-EErrorStatus mclA2RGB10ToRGB_C4P4R(const uint8_t* pSrc, int32_t srcStep, uint8_t* const pDst[4], int32_t dstStep, ImageSize roiSize, EBitDepth bd);
-EErrorStatus mclY410ToYUV_C4P4R(const uint8_t* pSrc, int32_t srcStep, uint8_t* const pDst[4], int32_t dstStep, ImageSize roiSize, EBitDepth bd);
-EErrorStatus mclNV16ToYCbCr422_P2P3R(const uint8_t *pSrcY, int32_t srcYStep, const uint8_t *pSrcUV, int32_t srcUVStep, uint8_t *pDst[3], int32_t dstStep[3], ImageSize roiSize, EBitDepth bd);
-EErrorStatus mclCopy_C4P4R(const uint8_t* pSrc, int32_t srcStep, uint8_t* const pDst[4], int32_t dstStep, ImageSize roiSize, EBitDepth bd);
+EErrorStatus mclYCbCr420ToYCrCb420_P2P3R(const uint8_t* pSrcY, int32_t srcYStep, const uint8_t* pSrcUV, int32_t srcUVStep, uint8_t* PDst[3], int32_t dstStep[3], ImageSize roiSize, uint32_t bd);
+EErrorStatus mclYCbCr422_C2P3R(uint8_t* pSrc, int32_t srcStep, uint8_t* pDst[3], int32_t dstStep[3], ImageSize roiSize, uint32_t bd);
+EErrorStatus mclA2RGB10ToRGB_C4P4R(const uint8_t* pSrc, int32_t srcStep, uint8_t* const pDst[4], int32_t dstStep, ImageSize roiSize, uint32_t bd);
+EErrorStatus mclY410ToYUV_C4P4R(const uint8_t* pSrc, int32_t srcStep, uint8_t* const pDst[4], int32_t dstStep, ImageSize roiSize, uint32_t bd);
+EErrorStatus mclNV16ToYCbCr422_P2P3R(const uint8_t *pSrcY, int32_t srcYStep, const uint8_t *pSrcUV, int32_t srcUVStep, uint8_t *pDst[3], int32_t dstStep[3], ImageSize roiSize, uint32_t bd);
+EErrorStatus mclCopy_C4P4R(const uint8_t* pSrc, int32_t srcStep, uint8_t* const pDst[4], int32_t dstStep, ImageSize roiSize, uint32_t bd);
 
-EErrorStatus mclRShiftC_C1IR(uint32_t value, uint8_t* pSrcDst, int32_t srcDstStep, ImageSize roiSize, EBitDepth bd);
+EErrorStatus mclRShiftC_C1IR(uint32_t value, uint8_t* pSrcDst, int32_t srcDstStep, ImageSize roiSize, uint32_t bd);
 
 /* PSNR */
-EErrorStatus mclNormDiff_L2_C1R(const uint8_t* pSrc1, int32_t src1Step, const uint8_t* pSrc2, int32_t src2Step, ImageSize roiSize, double& pValue, EBitDepth bd);
+EErrorStatus mclNormDiff_L2_C1R(const uint8_t* pSrc1, int32_t src1Step, const uint8_t* pSrc2, int32_t src2Step, ImageSize roiSize, double& pValue, uint32_t bd);
 
 /* SSIM */
-EErrorStatus mclConvert__u32f_C1R(const uint8_t* pSrc, int32_t srcStep, float* pDst, int32_t dstStep, ImageSize roiSize, EBitDepth bd);
+EErrorStatus mclConvert__u32f_C1R(const uint8_t* pSrc, int32_t srcStep, float* pDst, int32_t dstStep, ImageSize roiSize, uint32_t bd);
 EErrorStatus mclSqr_32f_C1R(const float* pSrc, int32_t srcStep, float* pDst, int32_t dstStep, ImageSize roiSize);
 EErrorStatus mclMul_32f_C1R(const float* pSrc1, int32_t srcStep1, const float* pSrc2, int32_t srcStep2, float* pDst, int32_t dstStep, ImageSize roiSize);
 EErrorStatus mclMean_32f_C1R(const float* pSrc, int32_t srcStep, ImageSize roiSize, double& value);

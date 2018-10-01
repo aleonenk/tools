@@ -18,6 +18,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_WARNINGS 1
+#endif
+
 #if defined(_OPENMP)
 #include <omp.h>
 #endif
@@ -49,18 +53,8 @@
 
 const double MAX_PSNR = 1000.0;
 
-double MaxError(EBitDepth bd) {
-    switch (bd)
-    {
-    case D010:
-        return 1023.0;
-    case D012:
-        return 4095.0;
-    case D016:
-        return 65535.0;
-    default:
-        return 255.0;
-    }
+double MaxError(uint32_t bd) {
+    return (double)((1 << bd) - 1);
 }
 
 double MSEToPSNR ( double p_mse, double MaxErr )
@@ -76,26 +70,24 @@ typedef std::vector < std::pair <char, uint32_t> > Component;
 class CReader {
 protected:
     FILE         *m_file;
-    uint32_t      m_num_fields;
     int32_t       m_cur_frame;
     bool          m_intl;
     ESequenceType m_type;
     int32_t       m_field_order;
     int32_t       m_bottom;
-    EBitDepth     m_bd;
+    uint32_t      m_bd;
     uint32_t      m_RShift;
     uint32_t      m_source_pixel_size;
 
 public:
     CReader() :
         m_file(0),
-        m_num_fields(0),
         m_cur_frame(-1),
         m_intl(0),
         m_type(UNKNOWN),
         m_field_order(0),
         m_bottom(0),
-        m_bd(D008),
+        m_bd(8),
         m_RShift(0),
         m_source_pixel_size(0)
     {};
@@ -104,12 +96,11 @@ public:
         if (m_file) { fclose(m_file); m_file = 0; }
     };
 
-    int32_t       GetFramesCount(void) const   { return m_num_fields; };
     bool          GetInterlaced(void) const    { return m_intl; };
-    EBitDepth     GetBitDepth() const          { return m_bd; };
+    int32_t       GetBitDepth() const          { return m_bd; };
     ESequenceType GetSqType(void) const        { return m_type; };
 
-    virtual EErrorStatus OpenReadFile(std::string name, uint32_t w, uint32_t h, ESequenceType type, int32_t order, EBitDepth bd, uint32_t RShift) = 0;
+    virtual EErrorStatus OpenReadFile(std::string name, int32_t &w, int32_t &h, ESequenceType &type, int32_t &order, uint32_t &bd, uint32_t &RShift) = 0;
     virtual bool ReadRawFrame(uint32_t field) = 0;
     virtual void GetFrame(int32_t idx, void *dst) = 0;
 };
@@ -134,24 +125,20 @@ public:
         }
     };
 
-    EErrorStatus OpenReadFile(std::string name, uint32_t w, uint32_t h, ESequenceType type, int32_t order, EBitDepth bd, uint32_t RShift) {
+    EErrorStatus OpenReadFile(std::string name, int32_t &w, int32_t &h, ESequenceType &type, int32_t &order, uint32_t &bd, uint32_t &RShift) {
         m_type = type; m_field_order = order; m_bd = bd; m_RShift = RShift;
+        if (w == 0 || h == 0)
+            return MCL_ERR_INVALID_PARAM;
         if(m_file) {
             mclFree(m_Meta.data); fclose(m_file);
         }
         if(NULL != (m_file = fopen(name.c_str(),"rb"))) {
-            m_source_pixel_size = ( bd == D008 || m_type == A2RGB10P || m_type == A2RGB10I ) ? 1 : 2;
+            m_source_pixel_size = ( bd == 8 || m_type == A2RGB10P || m_type == A2RGB10I ) ? 1 : 2;
             m_Meta.step         = w * h * 4;
             m_Meta.roi.width    = w;
             m_Meta.roi.height   = h;
             m_Meta.data         = mclMalloc(m_Meta.step, bd);
             if (!m_Meta.data)  return MCL_ERR_MEMORY_ALLOC;
-
-            _file_fseek(m_file, 0, SEEK_END);
-            m_num_fields = (uint32_t)(_file_ftell(m_file) / (m_Meta.step*m_source_pixel_size));
-            _file_fseek(m_file, 0, SEEK_SET);
-
-            if(0 != (m_intl = is_interlaced(type))) m_num_fields <<= 1;
 
             m_planes[0].data = mclMalloc(m_Meta.step, bd);
             if (!m_planes[0].data) return MCL_ERR_MEMORY_ALLOC;
@@ -176,8 +163,10 @@ public:
         for(int32_t i=0; i<4; i++) { planes[i] = m_planes[i].data; }
         if(m_intl) { m_bottom = (m_field_order)^(field&0x1); field >>= 1; }
         if(m_cur_frame != (int32_t)field) {
-            _file_fseek(m_file, ((uint64_t)field)*(m_Meta.step*m_source_pixel_size), SEEK_SET);
+            uint64_t tpos = ((uint64_t)field)*(m_Meta.step*m_source_pixel_size);
+            if (_file_fseek(m_file, tpos, SEEK_SET)) return false;
             size_t res = fread( m_Meta.data, m_source_pixel_size, m_Meta.step, m_file );
+            if (res != m_Meta.step*m_source_pixel_size) return false;
             switch (m_type) {
                 case RGB32P:
                 case RGB32I:
@@ -197,10 +186,8 @@ public:
             mclRShiftC_C1IR(m_RShift, m_planes[2].data, m_planes[2].step, m_planes[2].roi, m_bd);
             mclRShiftC_C1IR(m_RShift, m_planes[3].data, m_planes[3].step, m_planes[3].roi, m_bd);
             m_cur_frame = (int32_t)field;
-            return (res != m_Meta.step);
-        } else {
-            return false;
-        }
+        } 
+        return true;
     };
 
     void GetFrame(int32_t idx, void *dst) {
@@ -240,26 +227,24 @@ public:
         }
     };
 
-    EErrorStatus OpenReadFile(std::string name, uint32_t w, uint32_t h, ESequenceType type, int32_t order, EBitDepth bd, uint32_t RShift) {
+    EErrorStatus OpenReadFile(std::string name, int32_t &w, int32_t &h, ESequenceType &type, int32_t &order, uint32_t &bd, uint32_t &RShift) {
         m_type = type; m_field_order = order; m_bd = bd; m_RShift = RShift;
+
+        if (w == 0 || h == 0)
+            return MCL_ERR_INVALID_PARAM;
+
         if(m_file) {
             mclFree(m_Meta.data); fclose(m_file);
             if(m_planes[0].data!=m_Meta.data) mclFree(m_planes[0].data);
         }
         if(NULL != (m_file = fopen(name.c_str(),"rb"))) {
-            m_source_pixel_size = ( bd == D008 || m_type == Y410P || m_type == Y410I ) ? 1 : 2;
+            m_source_pixel_size = ( bd == 8 || m_type == Y410P || m_type == Y410I ) ? 1 : 2;
             if(get_chromaclass(type) == C420) {
                 m_Meta.step        = w * h * 3 / 2;
                 m_Meta.data        = mclMalloc(m_Meta.step, bd);
                 m_Meta.roi.width   = 1;
                 m_Meta.roi.height  = 1;
                 if (!m_Meta.data) return MCL_ERR_MEMORY_ALLOC;
-
-                _file_fseek(m_file, 0, SEEK_END);
-                m_num_fields = (uint32_t)(_file_ftell(m_file) / (m_Meta.step*m_source_pixel_size));
-                _file_fseek(m_file, 0, SEEK_SET);
-
-                if(0 != (m_intl = is_interlaced(type))) m_num_fields <<= 1;
 
                 m_planes[0].data        = m_Meta.data;
                 m_planes[0].roi.width   = w;
@@ -296,12 +281,6 @@ public:
                 m_Meta.roi.height  = 1;
                 if (!m_Meta.data) return MCL_ERR_MEMORY_ALLOC;
 
-                _file_fseek(m_file, 0, SEEK_END);
-                m_num_fields = (uint32_t)(_file_ftell(m_file) / (m_Meta.step*m_source_pixel_size));
-                _file_fseek(m_file, 0, SEEK_SET);
-
-                if(0 != (m_intl = is_interlaced(type))) m_num_fields <<= 1;
-
                 m_planes[0].data        = m_Meta.data;
                 m_planes[0].roi.width   = w;
                 m_planes[0].roi.height  = h;
@@ -337,12 +316,6 @@ public:
                 m_Meta.roi.width   = 1;
                 m_Meta.roi.height  = 1;
                 if (!m_Meta.data) return MCL_ERR_MEMORY_ALLOC;
-
-                _file_fseek(m_file, 0, SEEK_END);
-                m_num_fields = (uint32_t)(_file_ftell(m_file) / (m_Meta.step*m_source_pixel_size));
-                _file_fseek(m_file, 0, SEEK_SET);
-
-                if(0 != (m_intl = is_interlaced(type))) m_num_fields <<= 1;
 
                 m_planes[0].data        = m_Meta.data;
                 m_planes[0].roi.width   = m_planes[1].roi.width   = m_planes[2].roi.width  = m_planes[3].roi.width  = w;
@@ -394,8 +367,10 @@ public:
         for(int32_t i=0; i<4; i++) { planes[i] = m_planes[i].data; steps[i] = m_planes[i].step; }
         if(m_intl) { m_bottom = (m_field_order)^(field&0x1); field >>= 1; }
         if(m_cur_frame != (int32_t)field) {
-            _file_fseek(m_file, ((uint64_t)field)*(m_Meta.step*m_source_pixel_size), SEEK_SET);
-            size_t res = fread( m_Meta.data, m_source_pixel_size, m_Meta.step, m_file );
+            uint64_t tpos = ((uint64_t)field)*(m_Meta.step*m_source_pixel_size);
+            if (_file_fseek(m_file, tpos, SEEK_SET)) return false;
+            size_t res = fread(m_Meta.data, m_source_pixel_size, m_Meta.step, m_file);
+            if (res != m_Meta.step*m_source_pixel_size) return false;
             switch (m_type) {
                 case NV12P:
                 case NV12I:
@@ -432,10 +407,9 @@ public:
             mclRShiftC_C1IR(m_RShift, m_planes[1].data, m_planes[1].step, m_planes[1].roi, m_bd);
             mclRShiftC_C1IR(m_RShift, m_planes[2].data, m_planes[2].step, m_planes[2].roi, m_bd);
             m_cur_frame = (int32_t)field;
-            return (res != m_Meta.step);
-        } else {
-            return false;
         }
+
+        return true;
     };
 
     void GetFrame(int32_t idx, void *dst) {
@@ -447,6 +421,268 @@ public:
         }
     };
 };
+
+#ifndef NO_MSDK
+class CMSDKReader : public CReader {
+private:
+    SImage     m_Meta;
+    SImage     m_planes[4]; /* YUV order */
+    
+    mfxStatus          m_sts;
+    MFXVideoSession    m_session;
+    MFXVideoDECODE    *m_pDec;
+    mfxBitstream       m_mfxBS;
+    mfxVideoParam      m_mfxVideoParams;
+    mfxU8             *m_surfaceBuffers;
+    mfxFrameSurface1 **m_pmfxSurfaces;
+    mfxU16             m_numSurfaces;
+
+protected:
+    mfxStatus ReadBitStreamData(mfxBitstream* pBS, FILE* fSource)
+    {
+        memmove(pBS->Data, pBS->Data + pBS->DataOffset, pBS->DataLength);
+        pBS->DataOffset = 0;
+
+        mfxU32 nBytesRead = (mfxU32)fread(pBS->Data + pBS->DataLength, 1,
+            pBS->MaxLength - pBS->DataLength,
+            fSource);
+
+        if (0 == nBytesRead)
+            return MFX_ERR_MORE_DATA;
+
+        pBS->DataLength += nBytesRead;
+
+        return MFX_ERR_NONE;
+    }
+
+public:
+    CMSDKReader() {
+        memset(&m_Meta, 0, sizeof(m_Meta));
+        memset(&m_planes, 0, sizeof(m_planes));
+
+        m_sts = MFX_ERR_NONE;
+        m_pDec = NULL;
+        m_surfaceBuffers = NULL;
+        m_pmfxSurfaces = NULL;
+        m_numSurfaces = 0;
+        memset(&m_mfxBS, 0, sizeof(m_mfxBS));
+        m_mfxBS.MaxLength = 1024 * 1024;
+        m_mfxBS.Data = new mfxU8[m_mfxBS.MaxLength];
+    };
+
+    virtual ~CMSDKReader() {
+        if (m_Meta.data == m_planes[0].data) {
+            if (m_Meta.data) {
+                mclFree(m_Meta.data);
+                m_planes[0].data = 0;
+            }
+        }
+        else {
+            if (m_Meta.data) {
+                mclFree(m_Meta.data);
+            }
+            if (m_planes[0].data) {
+                mclFree(m_planes[0].data);
+            }
+        }
+
+        m_pDec->Close();
+        if (m_pDec) delete m_pDec;
+        if (m_surfaceBuffers) delete[] m_surfaceBuffers;
+        for (int i = 0; i < m_numSurfaces; i++) if(m_pmfxSurfaces[i]) delete m_pmfxSurfaces[i];
+        if (m_pmfxSurfaces) delete[] m_pmfxSurfaces;
+
+        delete[] m_mfxBS.Data;
+    };
+
+    EErrorStatus OpenReadFile(std::string name, int32_t &w, int32_t &h, ESequenceType &type, int32_t &order, uint32_t &bd, uint32_t &RShift) {
+        if (m_file) {
+            mclFree(m_Meta.data); fclose(m_file);
+            if (m_planes[0].data != m_Meta.data) mclFree(m_planes[0].data);
+        }
+
+        mfxVersion ver = { {0, 1} };
+        m_sts = m_session.Init(MFX_IMPL_AUTO_ANY, &ver);
+        if (m_sts != MFX_ERR_NONE) return MCL_ERR_UNKNOWN;
+
+        m_pDec = new MFXVideoDECODE(m_session);
+        if (m_pDec == NULL) return MCL_ERR_MEMORY_ALLOC;
+
+        bool isCodecDetected = false;
+        memset(&m_mfxVideoParams, 0, sizeof(m_mfxVideoParams));
+        m_mfxVideoParams.IOPattern = MFX_IOPATTERN_OUT_SYSTEM_MEMORY;
+        const mfxU32 CodecIds[] = { MFX_CODEC_HEVC, MFX_CODEC_AVC};
+
+        for(int cid = 0; cid < sizeof(CodecIds); cid++) {
+            if (m_file) fclose(m_file);
+            if (NULL == (m_file = fopen(name.c_str(), "rb"))) return MCL_ERR_INVALID_PARAM;
+            m_mfxBS.DataOffset = m_mfxBS.DataLength = 0;
+            m_mfxVideoParams.mfx.CodecId = CodecIds[cid];
+            while(1) {
+                m_sts = ReadBitStreamData(&m_mfxBS, m_file);
+                if (m_sts == MFX_ERR_MORE_DATA)
+                    break;
+                else if (m_sts != MFX_ERR_NONE)
+                    return MCL_ERR_INVALID_PARAM;
+                m_sts = m_pDec->DecodeHeader(&m_mfxBS, &m_mfxVideoParams);
+                if (m_sts != MFX_ERR_MORE_DATA)
+                    break;
+            }
+            isCodecDetected = (m_sts == MFX_ERR_NONE || m_sts == MFX_WRN_PARTIAL_ACCELERATION);
+            if (isCodecDetected) break;
+        }
+
+        if (!isCodecDetected) return MCL_ERR_INVALID_PARAM;
+
+        mfxFrameAllocRequest Request;
+        memset(&Request, 0, sizeof(Request));
+        m_sts = m_pDec->QueryIOSurf(&m_mfxVideoParams, &Request);
+        if (m_sts != MFX_ERR_NONE && m_sts != MFX_WRN_PARTIAL_ACCELERATION)
+            return MCL_ERR_UNKNOWN;
+        
+        switch (Request.Info.FourCC) {
+        case MFX_FOURCC_NV12:
+        case MFX_FOURCC_P010:
+            type = NV12P; break;
+        default:
+            return MCL_ERR_UNKNOWN;
+        }
+
+        if (w && w != Request.Info.CropW)
+            return MCL_ERR_INCOMPATIBLE_VIDEO;
+        else
+            w = Request.Info.CropW;
+
+        if (h && h != Request.Info.CropH)
+            return MCL_ERR_INCOMPATIBLE_VIDEO;
+        else
+            h = Request.Info.CropH;
+
+        if (bd && bd != Request.Info.BitDepthLuma)
+            return MCL_ERR_INCOMPATIBLE_VIDEO;
+        else
+            bd = Request.Info.BitDepthLuma;
+
+        RShift = Request.Info.Shift;
+        order = 0;
+
+        mfxU16 width = Request.Info.Width;
+        mfxU16 height = Request.Info.Height;
+        mfxU32 surfaceSize = 3 * width * height;
+
+        if (bd == 8) surfaceSize >>= 1;
+        
+        m_numSurfaces = Request.NumFrameSuggested;
+        m_surfaceBuffers = (mfxU8*) new mfxU8[surfaceSize * m_numSurfaces];
+        m_pmfxSurfaces = new mfxFrameSurface1 *[m_numSurfaces];
+        if (!m_pmfxSurfaces || !m_surfaceBuffers) return MCL_ERR_MEMORY_ALLOC;
+
+        for (int i = 0; i < m_numSurfaces; i++) {
+            m_pmfxSurfaces[i] = new mfxFrameSurface1;
+            memset(m_pmfxSurfaces[i], 0, sizeof(mfxFrameSurface1));
+            memcpy(&(m_pmfxSurfaces[i]->Info), &(m_mfxVideoParams.mfx.FrameInfo), sizeof(mfxFrameInfo));
+            m_pmfxSurfaces[i]->Data.Y = &m_surfaceBuffers[surfaceSize * i];
+            m_pmfxSurfaces[i]->Data.U = m_pmfxSurfaces[i]->Data.Y + width * height * ((bd == 8)?1:2);
+            m_pmfxSurfaces[i]->Data.V = m_pmfxSurfaces[i]->Data.U + ((bd == 8) ? 1 : 2);
+            m_pmfxSurfaces[i]->Data.Pitch = width*((bd == 8) ? 1 : 2);
+        }
+
+        m_sts = m_pDec->Init(&m_mfxVideoParams);
+        if (m_sts != MFX_ERR_NONE && m_sts != MFX_WRN_PARTIAL_ACCELERATION)
+            return MCL_ERR_UNKNOWN;
+
+        m_type = type; m_field_order = order; m_bd = bd; m_RShift = RShift; m_source_pixel_size = (bd == 8) ? 1 : 2;
+
+        if (get_chromaclass(type) == C420) {
+            m_Meta.step = w * h * 3 / 2;
+            m_Meta.data = NULL;
+            m_Meta.roi.width = 1;
+            m_Meta.roi.height = 1;
+
+            m_planes[0].data = mclMalloc(m_Meta.step, bd);
+            if (!m_planes[0].data) return MCL_ERR_MEMORY_ALLOC;
+            m_planes[0].roi.width = w;
+            m_planes[0].roi.height = h;
+            m_planes[0].step = w * m_source_pixel_size;
+
+            m_planes[1].roi.width = m_planes[2].roi.width = m_planes[0].roi.width >> 1;
+            m_planes[1].roi.height = m_planes[2].roi.height = m_planes[0].roi.height >> 1;
+            m_planes[1].step = m_planes[2].step = m_planes[0].step >> 1;
+
+            m_planes[2].data = m_planes[0].data + m_planes[0].roi.height*m_planes[0].step;
+            m_planes[1].data = m_planes[2].data + m_planes[2].roi.height*m_planes[2].step;
+        }
+
+        return MCL_ERR_NONE;
+    };
+
+    bool ReadRawFrame(uint32_t field) {
+        uint8_t *planes[4];
+        int32_t  steps[4];
+
+        for (int32_t i = 0; i < 4; i++) { planes[i] = m_planes[i].data; steps[i] = m_planes[i].step; }
+        if (m_intl) { m_bottom = (m_field_order) ^ (field & 0x1); field >>= 1; }
+        if (m_cur_frame != (int32_t)field) {
+            mfxSyncPoint syncp;
+            mfxFrameSurface1* pmfxOutSurface = NULL;
+            int nIndex = 0;
+            mfxStatus sts = MFX_ERR_NONE;
+            bool isFrameAviable = false;
+
+            while (!isFrameAviable && (MFX_ERR_NONE <= sts || MFX_ERR_MORE_DATA == sts || MFX_ERR_MORE_SURFACE == sts)) {
+                // if (MFX_WRN_DEVICE_BUSY == sts) Sleep(1);
+                if (MFX_ERR_MORE_DATA == sts) {
+                    sts = ReadBitStreamData(&m_mfxBS, m_file);
+                    if (sts != MFX_ERR_NONE) break;
+                }
+                if (MFX_ERR_MORE_SURFACE == sts || MFX_ERR_NONE == sts) {
+                    for (nIndex = 0; nIndex < m_numSurfaces; nIndex++)
+                        if (0 == m_pmfxSurfaces[nIndex]->Data.Locked) break;
+                    if (nIndex == m_numSurfaces) return false;
+                }
+                sts = m_pDec->DecodeFrameAsync(&m_mfxBS, m_pmfxSurfaces[nIndex], &pmfxOutSurface, &syncp);
+                if (MFX_ERR_NONE < sts && syncp) sts = MFX_ERR_NONE;
+                if (MFX_ERR_NONE == sts) sts = m_session.SyncOperation(syncp, 60000);
+                if (MFX_ERR_NONE == sts) {
+                    m_cur_frame++;
+                    isFrameAviable = (m_cur_frame == (int32_t)field);
+                }
+            }
+            if (sts == MFX_ERR_MORE_DATA) sts = MFX_ERR_NONE;
+            if (sts != MFX_ERR_NONE) return false;
+            while (!isFrameAviable && (MFX_ERR_NONE <= sts || MFX_ERR_MORE_SURFACE == sts)) {
+                // if (MFX_WRN_DEVICE_BUSY == sts) Sleep(1);
+                for (nIndex = 0; nIndex < m_numSurfaces; nIndex++)
+                    if (0 == m_pmfxSurfaces[nIndex]->Data.Locked) break;
+                if (nIndex == m_numSurfaces) return false;
+                sts = m_pDec->DecodeFrameAsync(NULL, m_pmfxSurfaces[nIndex], &pmfxOutSurface, &syncp);
+                if (MFX_ERR_NONE < sts && syncp) sts = MFX_ERR_NONE;
+                if (MFX_ERR_NONE == sts) sts = m_session.SyncOperation(syncp, 60000);
+                if (MFX_ERR_NONE == sts) {
+                    m_cur_frame++;
+                    isFrameAviable = (m_cur_frame == (int32_t)field);
+                }
+            }
+
+            if (!isFrameAviable) return false;
+            mclYCbCr420ToYCrCb420_P2P3R(pmfxOutSurface->Data.Y, pmfxOutSurface->Data.Pitch, pmfxOutSurface->Data.UV, pmfxOutSurface->Data.Pitch, planes, steps, m_planes[0].roi, m_bd);
+            mclRShiftC_C1IR(m_RShift, m_planes[0].data, m_planes[0].step, m_planes[0].roi, m_bd);
+            mclRShiftC_C1IR(m_RShift, m_planes[1].data, m_planes[1].step, m_planes[1].roi, m_bd);
+            mclRShiftC_C1IR(m_RShift, m_planes[2].data, m_planes[2].step, m_planes[2].roi, m_bd);
+        }
+        return true;
+    };
+
+    void GetFrame(int32_t idx, void *dst) {
+        memcpy((uint8_t*)dst, (uint8_t*)(m_planes + idx), sizeof(SImage));
+        SImage *destination = (SImage*)dst;
+        if (m_intl) {
+            if (m_bottom) destination->data += destination->step;
+            destination->step <<= 1; destination->roi.height >>= 1;
+        }
+    };
+};
+#endif
 
 class CMetricEvaluator {
 protected:
@@ -482,7 +718,7 @@ public:
             }
         }
     };
-    virtual int32_t AllocateResourses(void) = 0;
+    virtual EErrorStatus AllocateResourses(void) = 0;
     virtual void ComputeMetrics(std::vector< double > &val, std::vector< double > &avg) = 0;
 };
 
@@ -495,7 +731,7 @@ public:
         metric_pair.first = "APSNR"; metric_pair.second.first = MASK_APSNR; metric_pair.second.second = MASK_APSNR; metrics.push_back(metric_pair);
     };
     ~CPSNREvaluator(void) {};
-    int32_t AllocateResourses(void) { return 0; };
+    EErrorStatus AllocateResourses(void) { return MCL_ERR_NONE; };
     void ComputeMetrics(std::vector< double > &val, std::vector< double > &avg) {
         SImage i1_p, i2_p;
         double sum[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
@@ -546,7 +782,7 @@ private:
 
         for (i = 0; i < KernelSize; i++) pKernel[i] /= sum;
 
-        return 0;
+        return MCL_ERR_NONE;
     }
 
     void testFastSSIM_32f(
@@ -589,7 +825,7 @@ public:
         mclFree(m_mu1); mclFree(m_mu2); mclFree(m_mu1_sq); mclFree(m_mu2_sq); mclFree(m_mu1_mu2); mclFree(m_tmp);
     };
 
-    int32_t AllocateResourses(void) {
+    EErrorStatus AllocateResourses(void) {
         SImage ref;
 
         m_i1->GetFrame(0, &ref);
@@ -736,12 +972,14 @@ private:
         roi.width = width; roi.height = ys;
         ippiFilterRowBorderPipelineGetBufferSize_32f_C1R(roi, xs, &bsize);
         pCtx->pRowBuf = ippsMalloc_8u(bsize);
+        if (!pCtx->pRowBuf) return MCL_ERR_MEMORY_ALLOC;
 
         roi.width = width; roi.height = 1;
         ippiFilterColumnPipelineGetBufferSize_32f_C1R(roi, ys, &bsize);
         pCtx->pColBuf = ippsMalloc_8u(bsize);
+        if (!pCtx->pColBuf) return MCL_ERR_MEMORY_ALLOC;
 
-        return 0;
+        return MCL_ERR_NONE;
     }
 
     void freeSSIMContext(ssim_context* pCtx) {
@@ -889,14 +1127,15 @@ public:
         return gfsz;
     }
 
-    int AllocateResourses(void) {
+    EErrorStatus AllocateResourses(void) {
         SImage  ref;
-        int     asz = 0;
+        int     asz = 0, err;
         float   sigma = 1.5f;
 
         m_i1->GetFrame(0, &ref);
 
         m_kernel_values = ippsMalloc_32f(1024);
+        if(!m_kernel_values) return MCL_ERR_MEMORY_ALLOC;
 
         mc_krn[0] = m_kernel_values;
         mc_ksz[0] = GetGaussianSize(sigma, 0.0001f, mc_krn[0], 1024); asz += mc_ksz[0];
@@ -920,11 +1159,13 @@ public:
             if (m_i1->GetInterlaced()) m_ykidx[i]++;
         }
 
-        for (int i = 0; i < ssim_ctx_cnt; i++)
-            allocateSSIMContext(mc_ksz[m_xkidx[0]], mc_ksz[m_ykidx[0]], ref.roi.width, m_ssim_ctx + i);
+        for (int i = 0; i < ssim_ctx_cnt; i++) {
+            err = allocateSSIMContext(mc_ksz[m_xkidx[0]], mc_ksz[m_ykidx[0]], ref.roi.width, m_ssim_ctx + i);
+            if (err == MCL_ERR_MEMORY_ALLOC) return MCL_ERR_MEMORY_ALLOC;
+        }
 
         m_im1 = ippiMalloc_32f_C1(ref.roi.width, 5 * ref.roi.height / 2, &m_step);
-        if (!m_im1)  return -2;
+        if (!m_im1)  return MCL_ERR_MEMORY_ALLOC;
         m_im2 = (Ipp32f*)((Ipp8s*)m_im1 + ref.roi.height*m_step);
         m_imt = (Ipp32f*)((Ipp8s*)m_im2 + ref.roi.height*m_step);
 
@@ -947,7 +1188,7 @@ public:
                 mSize.height *= 2;
             }
         }
-        if ((ref.roi.width < mSize.width || ref.roi.height < mSize.height)) return -3;
+        if ((ref.roi.width < mSize.width || ref.roi.height < mSize.height)) return MCL_ERR_METRIC_FAIL;
 
         // Over-allocate temporary buffers for resize to cover both 420/422/444
         sSize = ref.roi;
@@ -959,7 +1200,7 @@ public:
             sSize = dSize;
         }
         m_pSpec = (IppiResizeSpec_32f*)ippsMalloc_8u(2 * specSizeMax);
-        if (!m_pSpec)  return -2;
+        if (!m_pSpec) return MCL_ERR_MEMORY_ALLOC;
 
         sSize = ref.roi;
         for (int l = 0; l<mmsim_depth; l++) {
@@ -971,9 +1212,9 @@ public:
             sSize = dSize;
         }
         m_pBuffer = ippsMalloc_8u(2 * bufSizeMax);
-        if (!m_pBuffer)  return -2;
+        if (!m_pBuffer) return MCL_ERR_MEMORY_ALLOC;
 
-        return 0;
+        return MCL_ERR_NONE;
     };
 
     void ComputeMetrics(std::vector< double > &val, std::vector< double > &avg) {
@@ -1003,7 +1244,7 @@ public:
                         pTmp1 = pSrc1; pSrc1 = pSrc2; pSrc2 = pTmp; pTmp = pTmp1;
                     }
                     else {
-                        if (m_i1->GetBitDepth() == D008) {
+                        if (m_i1->GetBitDepth() == 8) {
                             ippiConvert_8u32f_C1R((Ipp8u*)i1_p.data, i1_p.step, pSrc1, m_step, i1_p.roi);
                             ippiConvert_8u32f_C1R((Ipp8u*)i2_p.data, i2_p.step, pSrc2, m_step, i2_p.roi);
                         }
@@ -1141,7 +1382,7 @@ public:
         for(int32_t i=0; i<64; i++) impm[i] = 1.0f/(float)mpegmatrix[i];
     };
     ~CMWDVQMEvaluator(void) {};
-    int32_t AllocateResourses(void) { return 0; };
+    EErrorStatus AllocateResourses(void) { return MCL_ERR_NONE; };
     void ComputeMetrics(std::vector< double > &val, std::vector< double > &avg) {
         SImage      i1_p, i2_p;
         double      sum[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
@@ -1155,7 +1396,7 @@ public:
                 bmean = 0; bmax = 0;
                 for(m = 0; m < (uint32_t)(i1_p.roi.height>>3); m++) {
                     for(k = 0; k < (uint32_t)(i1_p.roi.width>>3); k++) {
-                        if (m_i1->GetBitDepth() == D008) {
+                        if (m_i1->GetBitDepth() == 8) {
                             ippiConvert_8u32f_C1R((uint8_t*)(i1_p.data+((m*i1_p.step+k)<<3)), i1_p.step, fb1, 8*sizeof(float), sz8x8);
                             ippiConvert_8u32f_C1R((uint8_t*)(i2_p.data+((m*i2_p.step+k)<<3)), i2_p.step, fb2, 8*sizeof(float), sz8x8);
                         } else {
@@ -1197,18 +1438,19 @@ public:
         pBuf = 0;
     };
     ~CUQIEvaluator(void) { ippsFree(pBuf); };
-    int AllocateResourses(void) {
+    EErrorStatus AllocateResourses(void) {
         SImage  i1_p;
         int     bsize;
 
         m_i1->GetFrame(0, &i1_p);
 
-        if (m_i1->GetBitDepth() == D008) ippiQualityIndexGetBufferSize(ipp8u, ippC1, i1_p.roi, &bsize);
+        if (m_i1->GetBitDepth() == 8) ippiQualityIndexGetBufferSize(ipp8u, ippC1, i1_p.roi, &bsize);
         else ippiQualityIndexGetBufferSize(ipp16u, ippC1, i1_p.roi, &bsize);
 
         pBuf = ippsMalloc_8u(bsize);
+        if (!pBuf) return MCL_ERR_MEMORY_ALLOC;
 
-        return 0;
+        return MCL_ERR_NONE;
     };
     void ComputeMetrics(std::vector< double > &val, std::vector< double > &avg) {
         SImage  i1_p, i2_p;
@@ -1218,8 +1460,8 @@ public:
         for (i = 0; i<3; i++) {
             if (c_mask[i] & MASK_UQI) {
                 m_i1->GetFrame(i, &i1_p); m_i2->GetFrame(i, &i2_p);
-                if (m_i1->GetBitDepth() == D008) ippiQualityIndex_8u32f_C1R((Ipp8u*)i1_p.data, i1_p.step, (Ipp8u*)i2_p.data, i2_p.step, i1_p.roi, &(sum[i]), pBuf);
-                else if (m_i1->GetBitDepth() == D010 || m_i1->GetBitDepth() == D012 || m_i1->GetBitDepth() == D016) ippiQualityIndex_16u32f_C1R((Ipp16u*)i1_p.data, i1_p.step, (Ipp16u*)i2_p.data, i2_p.step, i1_p.roi, &(sum[i]), pBuf);
+                if (m_i1->GetBitDepth() == 8) ippiQualityIndex_8u32f_C1R((Ipp8u*)i1_p.data, i1_p.step, (Ipp8u*)i2_p.data, i2_p.step, i1_p.roi, &(sum[i]), pBuf);
+                else if (m_i1->GetBitDepth() == 10 || m_i1->GetBitDepth() == 12 || m_i1->GetBitDepth() == 16) ippiQualityIndex_16u32f_C1R((Ipp16u*)i1_p.data, i1_p.step, (Ipp16u*)i2_p.data, i2_p.step, i1_p.roi, &(sum[i]), pBuf);
                 val.push_back((double)(sum[i])); avg[j++] += sum[i];
             }
         }
@@ -1238,28 +1480,34 @@ public:
 };
 #endif
 
-static const char *errors_table[] = {
-    "ERROR: Unable to parse input metric specifications!",
-    "ERROR: Empty metrics set!",
-    "ERROR: Unable to open first sequence file!",
-    "ERROR: Unable to open second sequence file!",
-    "ERROR: Unspecified error during metric calculation!",
-    "ERROR: Empty input file!",
-    "WARNING: Incorrect selective frames parameters: not enough frames in YUVs!",
-    "ERROR: Unsupported sequence type!",
-    "ERROR: Unable to compare interlaced with progressive sequences!",
-    "ERROR: Unable to compare sequences of different sizes on chromaticity channels!",
-    "ERROR: Unable to compare RGB with YUV!\n",
-    "ERROR: Unable to use parameters \"fs\" and \"numseekframe\" together!",
-    "WARNING: Wrong seek ranges!",
-    "ERROR: Failed to allocate memory!",
-    "ERROR: Unsupported bit depth!"
+static const char *error_msg[] = 
+{
+    "",
+    "Unable to parse commandline options.",
+    "Empty metrics set.",
+    "Unable to read from first sequence file.",
+    "Unable to read from second sequence file.",
+    "Unspecified error during metric calculation.",
+    "Input file IO failed.",
+    "Unsupported video type.",
+    "Incompatible streams.",
+    "Incompatible command line options.",
+    "Memory allocation failure.",
+    "NULL pointer.",
+    "Invalid parameters.",
+    "Undefined error.", // must be the last error
 };
 
-int32_t usage(void)
+inline EErrorStatus failure(EErrorStatus err_id, const char *msg = 0) {
+    if (err_id > MCL_ERR_NONE) return err_id;
+    if (err_id < MCL_ERR_UNKNOWN) err_id = MCL_ERR_UNKNOWN;
+    std::cout << "Error: " << error_msg[-err_id]; if (msg) std::cout << " " << msg; std::cout << std::endl; return err_id;
+}
+
+EErrorStatus usage(void)
 {
     std::cout << "Usage:" << std::endl;
-    std::cout << "metrics_calc_lite.exe <Options> <metric1> ... [<metricN>]... <plane1> ...[<planeN>] ..." << std::endl;
+    std::cout << "metrics_calc_lite <options> <metric1> ... [<metricN>]... <plane1> ...[<planeN>] ..." << std::endl;
 #if defined(NO_IPP) || defined(LEGACY_IPP)
     std::cout << "Possible metrics are: psnr, apsnr, ssim" << std::endl;
 #else
@@ -1269,21 +1517,20 @@ int32_t usage(void)
     std::cout << "Required options are:" << std::endl;
     std::cout << "    -i1 <filename> - name of first file to compare" << std::endl;
     std::cout << "    -i2 <filename> - name of second file to compare" << std::endl;
-    std::cout << "    -w  <integer> - width of sequences pixels" << std::endl;
-    std::cout << "    -h  <integer> - height of sequences pixels" << std::endl;
-    std::cout << "Optional parameters are:" << std::endl;
-    std::cout << "    -fs1 <i1> <i2> <i3> - calculate metric only for <i1> number of frames from 1st file starting with <i2>th sequence frame with step <i3>" << std::endl;
-    std::cout << "    -fs2 <i1> <i2> <i3> - calculate metric only for <i1> number of frames from 2nd file starting with <i2>th sequence frame with step <i3>" << std::endl;
-    std::cout << "    -fs <i1> <i2> <i3>  - calculate metric only for <i1> number of frames starting with <i2>th sequence frame with step <i3>" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Additional options are:" << std::endl;
+    std::cout << "    -w  <integer>       - width of input frames in pixels (required if both inputs are uncompressed)" << std::endl;
+    std::cout << "    -h  <integer>       - height of input frames in pixels (required if both inputs are uncompressed)" << std::endl;
     std::cout << "    -alpha              - calculate metrics for RGB alpha channel" << std::endl;
-    std::cout << "    -numseekframe1 <from> <to> <num> - performs seeks to particular position in 1st file. FROM - position FROM, TO - seek position, NUM - number of iterations" << std::endl;
-    std::cout << "    -numseekframe2 <from> <to> <num> - performs seeks to particular position in 2nd file. FROM - position FROM, TO - seek position, NUM - number of iterations" << std::endl;
     std::cout << "    -nopfm              - suppress per-frame metrics output" << std::endl;
     std::cout << "    -st type1 [type2]   - input sequences type (type1 for both sequences, type2 override type for second sequence)" << std::endl;
     std::cout << "                          4:2:0 types: i420p (default), i420i, yv12p, nv12p, yv12i, nv12i" << std::endl;
     std::cout << "                          4:2:2 types: yuy2p, yuy2i, nv16p, nv16i, i422p, i422i" << std::endl;
     std::cout << "                          4:4:4 types: ayuvp, ayuvi, y410p, y410i, y416p, y416i, i444p, i444i, i410p, i410i" << std::endl;
     std::cout << "                          RGB types  : rgb32p, rgb32i, a2rgb10p, a2rgb10i, argb16p" << std::endl;
+#ifndef NO_MSDK
+    std::cout << "                          elementary streams: video" << std::endl;
+#endif
     std::cout << "    -bd <integer>       - bit depth of sequences pixels" << std::endl;
     std::cout << "                          Possible values: 8, 10, 12, 16" << std::endl;
     std::cout << "    -rshift1 <integer>  - shift pixel values for <integer> bits to the right in first file" << std::endl;
@@ -1291,19 +1538,32 @@ int32_t usage(void)
     std::cout << "    -btm_first          - bottom field first for interlaced sources" << std::endl;
     std::cout << "    -btm_first1         - bottom field first for the 1st source" << std::endl;
     std::cout << "    -btm_first2         - bottom field first for the 2nd source" << std::endl;
+    std::cout << std::endl;
+    std::cout << "Optional frame subsampling options are:" << std::endl;
+    std::cout << "    -fs  <i1> <i2> <i3> - to calculate metrics files will be sampled for frames number <i2> + N*<i3>, where N is in range from 0 to <i1>" << std::endl;
+    std::cout << "    -fs1 <i1> <i2> <i3> - to calculate metrics 1st file will be sampled for frames number <i2> + N*<i3>, where N is in range from 0 to <i1>" << std::endl;
+    std::cout << "    -fs2 <i1> <i2> <i3> - to calculate metrics 2nd file will be sampled for frames number <i2> + N*<i3>, where N is in range from 0 to <i1>" << std::endl;
+    std::cout << "    -numseekframe1 <i1> <i2> <i3> - to calculate metrics 1st file will be sampled <i3>+1 times for frames number <i2>,<i2+1>,...<i1>" << std::endl;
+    std::cout << "    -numseekframe2 <i1> <i2> <i3> - to calculate metrics 2nd file will be sampled <i3>+1 times for frames number <i2>,<i2+1>,...<i1>" << std::endl;
+    std::cout << std::endl;
     std::cout << "NOTES:    1. Different chromaticity representations can be compared on Y channel only." << std::endl;
-    std::cout << "          2. In case of 10 bits non-zero values must be located from bit #0 to bit #9." << std::endl;
-    std::cout << "             If such bits are located from bit #6 to bit #15 use parameters \"-rshift1 6 -rshift2 6\"" << std::endl;
-    std::cout << "Example: " << std::endl;
-    std::cout << "    metrics_calc_lite.exe -i1 foreman.yuv -i2 x264_decoded.yuv -w 352 -h 288 psnr all ssim y" << std::endl;
-    std::cout << "    metrics_calc_lite.exe -i1 foreman.yuv -i2 x264_decoded.yuv -w 352 -h 288 -nopfm -st i420p -fs 20 0 1 psnr y" << std::endl << std::endl;
+    std::cout << "          2. In case of 10/12 bits input non-zero values must be located from bit #0 to bit #9/#11." << std::endl;
+    std::cout << "             If such bits are located from bit #6/#4 to bit #15 use appropriate -rshift options." << std::endl;
+    std::cout << "          3. For interlaced input all fields will we treated as independant frames for sampling and metrics calculation." << std::endl;
+    std::cout << "          4. Frame sampling options -fs and -numseekframe are mutualy exclusive." << std::endl;
+    std::cout << std::endl;
+    std::cout << "Examples: " << std::endl;
+    std::cout << "    metrics_calc_lite.exe -i1 foreman.yuv -i2 h264_decoded.yuv -w 352 -h 288 psnr all ssim y" << std::endl;
+    std::cout << "    metrics_calc_lite.exe -i1 foreman.yuv -i2 h264_decoded.yuv -w 352 -h 288 -nopfm -st i420p -fs 20 0 1 psnr y" << std::endl;
+#ifndef NO_MSDK
+    std::cout << "    metrics_calc_lite.exe -i1 foreman.yuv -i2 h264_encoded.264 -st i420p video -nopfm mssim y" << std::endl;
+#endif
+    std::cout << std::endl;
 
-    std::cout << "Wrong input parameters!!!" << std::endl;
-
-    return -1;
+    return failure(MCL_ERR_WRONG_OPTIONS);
 }
 
-int32_t parse_metrics(Component &cmps, int32_t argc, char** argv, int32_t curc)
+EErrorStatus parse_metrics(Component &cmps, int32_t argc, char** argv, int32_t curc)
 {
     uint32_t cm;
     bool         not_metric, not_plane;
@@ -1322,7 +1582,7 @@ int32_t parse_metrics(Component &cmps, int32_t argc, char** argv, int32_t curc)
 #endif
             else break;
         }
-        if (not_metric) return -1;
+        if (not_metric) return failure(MCL_ERR_WRONG_OPTIONS, "Unsupported metric!");
 
         not_plane = true;
         while ( curc < argc ) {
@@ -1333,13 +1593,13 @@ int32_t parse_metrics(Component &cmps, int32_t argc, char** argv, int32_t curc)
             else if ( strcmp( argv[curc], "all" ) == 0 ) { for(size_t i = 0; i < cmps.size(); i++) cmps[i].second |= cm; curc++; not_plane = false;}
             else break;
         }
-        if (not_plane) return -1;
+        if (not_plane) return failure(MCL_ERR_WRONG_OPTIONS, "Unsupported color plane!");
     }
 
-    return 0;
+    return MCL_ERR_NONE;
 }
 
-void parse_fourcc(char* str, ESequenceType& sq_type, EBitDepth& bd)
+void parse_fourcc(char* str, ESequenceType& sq_type, uint32_t& bd)
 {
     if     ( strcmp( str, "i420p" ) == 0 )    { sq_type = I420P; }
     else if( strcmp( str, "i420i" ) == 0 )    { sq_type = I420I; }
@@ -1355,19 +1615,22 @@ void parse_fourcc(char* str, ESequenceType& sq_type, EBitDepth& bd)
     else if( strcmp( str, "i422i" ) == 0 )    { sq_type = I422I; }
     else if( strcmp( str, "ayuvp" ) == 0 )    { sq_type = AYUVP; }
     else if( strcmp( str, "ayuvi" ) == 0 )    { sq_type = AYUVI; }
-    else if( strcmp( str, "y410p" ) == 0 )    { sq_type = Y410P; bd = D010; }
-    else if( strcmp( str, "y410i" ) == 0 )    { sq_type = Y410I; bd = D010; }
-    else if( strcmp( str, "y416p" ) == 0)     { sq_type = Y416P; bd = D016; }
-    else if( strcmp( str, "y416i" ) == 0)     { sq_type = Y416I; bd = D016; }
+    else if( strcmp( str, "y410p" ) == 0 )    { sq_type = Y410P; bd = 10; }
+    else if( strcmp( str, "y410i" ) == 0 )    { sq_type = Y410I; bd = 10; }
+    else if( strcmp( str, "y416p" ) == 0)     { sq_type = Y416P; bd = 16; }
+    else if( strcmp( str, "y416i" ) == 0)     { sq_type = Y416I; bd = 16; }
     else if( strcmp( str, "i444p" ) == 0 )    { sq_type = I444P; }
     else if( strcmp( str, "i444i" ) == 0 )    { sq_type = I444I; }
-    else if( strcmp( str, "i410p" ) == 0 )    { sq_type = I410P; bd = D010; }
-    else if( strcmp( str, "i410i" ) == 0 )    { sq_type = I410I; bd = D010; }
+    else if( strcmp( str, "i410p" ) == 0 )    { sq_type = I410P; bd = 10; }
+    else if( strcmp( str, "i410i" ) == 0 )    { sq_type = I410I; bd = 10; }
     else if( strcmp( str, "rgb32p" ) == 0 )   { sq_type = RGB32P; }
     else if( strcmp( str, "rgb32i" ) == 0 )   { sq_type = RGB32I; }
-    else if( strcmp( str, "a2rgb10p" ) == 0 ) { sq_type = A2RGB10P; bd = D010; }
-    else if( strcmp( str, "a2rgb10i" ) == 0 ) { sq_type = A2RGB10I; bd = D010; }
-    else if (strcmp( str, "argb16p"  ) == 0)   { sq_type = ARGB16P; bd = D016; }
+    else if( strcmp( str, "a2rgb10p" ) == 0 ) { sq_type = A2RGB10P; bd = 10; }
+    else if( strcmp( str, "a2rgb10i" ) == 0 ) { sq_type = A2RGB10I; bd = 10; }
+    else if( strcmp( str, "argb16p"  ) == 0)  { sq_type = ARGB16P; bd = 16; }
+#ifndef NO_MSDK
+    else if( strcmp( str, "video") == 0)      { sq_type = VIDEO;}
+#endif
     else                                      { sq_type = UNKNOWN; }
 }
 
@@ -1382,16 +1645,12 @@ int32_t main(int32_t argc, char** argv)
     std::string   input_name1, input_name2;
     bool          no_pfm, alpha_channel;
     ESequenceType sq1_type, sq2_type;
-    EBitDepth     bd;
-    uint32_t      rshift1, rshift2;
+    EErrorStatus  err;
+    uint32_t      bd, rshift1, rshift2;
 
-    bool is_fs_set = false;
-    bool is_fs1_set = false;
-    bool is_fs2_set = false;
-
-    cur_param = 1; w = h = 0; sq1_type = sq2_type = I420P; bd = D008; no_pfm = false; alpha_channel = false; order1 = 0; order2 = 0; rshift1 = 0; rshift2 = 0;
-    fm1_cntr = -1; fm1_frst = 0; fm1_step = 1;
-    fm2_cntr = -1; fm2_frst = 0; fm2_step = 1;
+    cur_param = 1; w = h = 0; sq1_type = sq2_type = I420P; bd = 8; no_pfm = false; alpha_channel = false; order1 = 0; order2 = 0; rshift1 = 0; rshift2 = 0;
+    fm1_cntr = 0; fm1_frst = 0; fm1_step = 1;
+    fm2_cntr = 0; fm2_frst = 0; fm2_step = 1;
     seek_num1 = 0; seek_from1 = -1; seek_to1 = -1;
     seek_num2 = 0; seek_from2 = -1; seek_to2 = -1;
     while ( cur_param < argc ) {
@@ -1408,26 +1667,19 @@ int32_t main(int32_t argc, char** argv)
         } else if ( strcmp( argv[cur_param], "-rshift2" ) == 0 && cur_param + 1 < argc ) {
             rshift2 = atoi(argv[ cur_param + 1 ]); cur_param += 2;
         } else if ( strcmp( argv[cur_param], "-fs" ) == 0 && cur_param + 3 < argc ) {
-            is_fs_set = true;
             fm1_cntr = fm2_cntr = atoi(argv[ cur_param + 1 ]);
             fm1_frst = fm2_frst = atoi(argv[ cur_param + 2 ]);
             fm1_step = fm2_step = atoi(argv[ cur_param + 3 ]);
             cur_param += 4;
         } else if ( strcmp( argv[cur_param], "-fs1" ) == 0 && cur_param + 3 < argc ) {
-            if (!is_fs_set) {
-                is_fs1_set = true;
-                fm1_cntr = atoi(argv[ cur_param + 1 ]);
-                fm1_frst = atoi(argv[ cur_param + 2 ]);
-                fm1_step = atoi(argv[ cur_param + 3 ]);
-            }
+            fm1_cntr = atoi(argv[ cur_param + 1 ]);
+            fm1_frst = atoi(argv[ cur_param + 2 ]);
+            fm1_step = atoi(argv[ cur_param + 3 ]);
             cur_param += 4;
         } else if ( strcmp( argv[cur_param], "-fs2" ) == 0 && cur_param + 3 < argc ) {
-            if (!is_fs_set) {
-                is_fs2_set = true;
-                fm2_cntr = atoi(argv[ cur_param + 1 ]);
-                fm2_frst = atoi(argv[ cur_param + 2 ]);
-                fm2_step = atoi(argv[ cur_param + 3 ]);
-            }
+            fm2_cntr = atoi(argv[ cur_param + 1 ]);
+            fm2_frst = atoi(argv[ cur_param + 2 ]);
+            fm2_step = atoi(argv[ cur_param + 3 ]);
             cur_param += 4;
         } else if ( strcmp( argv[cur_param], "-nopfm" ) == 0 ) {
             no_pfm = true; cur_param += 1;
@@ -1439,144 +1691,110 @@ int32_t main(int32_t argc, char** argv)
             order1 = 1; cur_param += 1;
         } else if ( strcmp( argv[cur_param], "-btm_first2" ) == 0 ) {
             order2 = 1; cur_param += 1;
-        } else if ( strcmp( argv[cur_param], "-numseekframe1" ) == 0 ) {
-            if (!is_fs_set && !is_fs1_set && !is_fs2_set) {
+        } else if ( strcmp( argv[cur_param], "-numseekframe1" ) == 0 && cur_param + 3 < argc) {
                 seek_from1 = atoi(argv[ cur_param + 1 ]);
                 seek_to1   = atoi(argv[ cur_param + 2 ]);
                 seek_num1  = atoi(argv[ cur_param + 3 ]);
                 cur_param += 4;
-            } else {
-                std::cout << errors_table[11] << std::endl; return -11;
-            }
-        } else if ( strcmp( argv[cur_param], "-numseekframe2" ) == 0 ) {
-            if (!is_fs_set && !is_fs1_set && !is_fs2_set) {
+        } else if ( strcmp( argv[cur_param], "-numseekframe2" ) == 0 && cur_param + 3 < argc) {
                 seek_from2 = atoi(argv[ cur_param + 1 ]);
                 seek_to2   = atoi(argv[ cur_param + 2 ]);
                 seek_num2  = atoi(argv[ cur_param + 3 ]);
                 cur_param += 4;
-            } else {
-                std::cout << errors_table[11] << std::endl; return -11; }
         } else if ( strcmp( argv[cur_param], "-bd" ) == 0 && cur_param + 1 < argc ) {
-            if( strcmp( argv[cur_param + 1], "8" ) == 0 )       { bd = D008; cur_param += 2; }
-            else if( strcmp( argv[cur_param + 1], "10" ) == 0 ) { bd = D010; cur_param += 2; }
-            else if( strcmp( argv[cur_param + 1], "12" ) == 0 ) { bd = D012; cur_param += 2; }
-            else if( strcmp( argv[cur_param + 1], "16" ) == 0 ) { bd = D016; cur_param += 2; }
-            else { std::cout << errors_table[14] << std::endl; return -14;}
+            bd = atoi(argv[cur_param + 1]); cur_param += 2;
         } else if ( strcmp( argv[cur_param], "-st" ) == 0 && cur_param + 1 < argc ) {
-            parse_fourcc(argv[cur_param + 1], sq1_type, bd);
-            if (sq1_type == UNKNOWN) { std::cout << errors_table[7] << std::endl; return -7; }
-            cur_param += 2;
+            parse_fourcc(argv[cur_param + 1], sq1_type, bd); cur_param += 2;
             if(cur_param < argc) {
                 parse_fourcc(argv[cur_param], sq2_type, bd);
                 if (sq2_type == UNKNOWN) { sq2_type = sq1_type; }
                 else                     { cur_param++; }
             }
-            if(is_interlaced(sq1_type)!=is_interlaced(sq2_type)) {
-                std::cout << errors_table[8] << std::endl; return -8;
-            }
-        } else break;
+        } else 
+            break;
     }
 
-    if( is_rgb(sq1_type) != is_rgb(sq2_type) ) {
-        std::cout << errors_table[10] << std::endl; return -10;
-    }
+    if (input_name1.empty() || input_name2.empty()) return usage();
+
+    if (w < 0) return failure(MCL_ERR_WRONG_OPTIONS, "Incorrect width!");
+    if (h < 0) return failure(MCL_ERR_WRONG_OPTIONS, "Incorrect height!");
+    if (bd != 8 && bd != 10 && bd != 12 && bd != 16) return failure(MCL_ERR_WRONG_OPTIONS, "Incorrect bitdepth!");
+    if ((rshift1 && bd == 8) || (bd + rshift1 > 16)) return failure(MCL_ERR_WRONG_OPTIONS, "Incorrect shift for first sequence!");
+    if ((rshift2 && bd == 8) || (bd + rshift2 > 16)) return failure(MCL_ERR_WRONG_OPTIONS, "Incorrect shift for second sequence!");
+
+    if (sq1_type == UNKNOWN || sq2_type == UNKNOWN) return failure(MCL_ERR_UNSUPPORTED_VIDEO);
 
     CReader *reader1 = 0, *reader2 = 0;
-
-    if( is_rgb(sq1_type) ) {
+    if (is_rgb(sq1_type)) {
         reader1 = new CRGBReader();
         reader2 = new CRGBReader();
         INIT_RGB(cmps, alpha_channel);
     } else {
-        reader1 = new CYUVReader();
-        reader2 = new CYUVReader();
+#ifndef NO_MSDK
+        if (sq1_type == VIDEO) 
+            reader1 = new CMSDKReader();
+        else 
+#endif
+            reader1 = new CYUVReader();
+#ifndef NO_MSDK
+        if (sq2_type == VIDEO)
+            reader2 = new CMSDKReader();
+        else
+#endif
+            reader2 = new CYUVReader();
         INIT_YUV(cmps);
     }
+#ifndef NO_MSDK
+    if (sq2_type == VIDEO) {
+        err = reader2->OpenReadFile(input_name2.c_str(), w, h, sq2_type, order2, bd, rshift2); if (err) return failure(err, "Second sequence!");
+        err = reader1->OpenReadFile(input_name1.c_str(), w, h, sq1_type, order1, bd, rshift1); if (err) return failure(err, "First sequence!");
+    } else
+#endif
+    {
+        err = reader1->OpenReadFile(input_name1.c_str(), w, h, sq1_type, order1, bd, rshift1); if (err) return failure(err, "First sequence!");
+        err = reader2->OpenReadFile(input_name2.c_str(), w, h, sq2_type, order2, bd, rshift2); if (err) return failure(err, "Second sequence!");
+    }
 
-    if ( input_name1.empty() || input_name2.empty() || w <= 0 || h <= 0 ) { return usage(); }
-
-    int32_t err = parse_metrics(cmps, argc, argv, cur_param);
-    if ( err == -1 ) { std::cout << errors_table[0] << std::endl; return -1; }
-
+    if (is_interlaced(sq1_type) != is_interlaced(sq2_type)) return failure(MCL_ERR_INCOMPATIBLE_VIDEO, "Can't compare progressive and interlaced sequences!");
+    if (is_rgb(sq1_type) != is_rgb(sq2_type)) return failure(MCL_ERR_INCOMPATIBLE_VIDEO, "Can't compare YUV and RGB sequences!");
+    
+    if (err = parse_metrics(cmps, argc, argv, cur_param)) return failure(err);
+    
     char all_metrics_mask = 0;
     for (size_t i = 0; i < cmps.size(); i++) all_metrics_mask |= cmps[i].second;
-    if ( !all_metrics_mask ) { std::cout << errors_table[1] << std::endl; return -2; };
+    if (!all_metrics_mask) return failure(MCL_ERR_EMPTY_METRICSET);
 
     if (get_chromaclass(sq1_type) != get_chromaclass(sq2_type))
-        if(cmps[1].second != 0 || cmps[2].second != 0) { std::cout << errors_table[9] << std::endl; return -9; };
+        if (cmps[1].second != 0 || cmps[2].second != 0) return failure(MCL_ERR_INCOMPATIBLE_VIDEO, "Can't compare chroma with different sampling!");
 
-    err = reader1->OpenReadFile( input_name1.c_str(), w, h, sq1_type, order1, bd, rshift1);
-    if ( err == MCL_ERR_INVALID_PARAM ) { std::cout << errors_table[2] << std::endl; return -3; }
-    if ( err == MCL_ERR_MEMORY_ALLOC )  { std::cout << errors_table[13] << std::endl; return -13; }
+    if ((fm1_cntr != 0 || fm2_cntr != 0) && (seek_num1 != 0 || seek_num2 != 0))
+        return failure(MCL_ERR_WRONG_OPTIONS, "Can't define both -fs and -numseekframe!");
 
-    err = reader2->OpenReadFile( input_name2.c_str(), w, h, sq2_type, order2, bd, rshift2);
-    if ( err == MCL_ERR_INVALID_PARAM ) { std::cout << errors_table[3] << std::endl; return -4; }
-    if ( err == MCL_ERR_MEMORY_ALLOC )  { std::cout << errors_table[13] << std::endl; return -13; }
+    if ((fm1_cntr != 0) && ((fm1_cntr < 1) || (fm1_frst < 0) || (fm1_step < 1)))
+        return failure(MCL_ERR_WRONG_OPTIONS, "Field count and step must be positive, field number must be non-negative for first sequence");
+    if ((fm2_cntr != 0) && ((fm2_cntr < 1) || (fm2_frst < 0) || (fm2_step < 1)))
+        return failure(MCL_ERR_WRONG_OPTIONS, "Field count and step must be positive, field number must be non-negative for second sequence");
+    if ((seek_num1 != 0) && ((seek_to1 < 0) || (seek_from1 <= seek_to1) || (seek_num1 < 1)))
+        return failure(MCL_ERR_WRONG_OPTIONS, "Seeking count must be positive, seek must be performed backwards to some non-negative frame id for first sequence");
+    if ((seek_num2 != 0) && ((seek_to2 < 0) || (seek_from2 <= seek_to2) || (seek_num2 < 1)))
+        return failure(MCL_ERR_WRONG_OPTIONS, "Seeking count must be positive, seek must be performed backwards to some non-negative frame id for second sequence");
+    if (((fm1_cntr == 0) && (fm2_cntr > 0)) || ((fm1_cntr > 0) && (fm2_cntr == 0)))
+        return failure(MCL_ERR_WRONG_OPTIONS, "If field count for one sequence is positive, it must be positive for another");
 
-    int32_t frames1 = reader1->GetFramesCount();
-    int32_t frames2 = reader2->GetFramesCount();
-    int32_t frames = (std::min)(frames1, frames2);
-
-    if (frames == 0) { std::cout << errors_table[5] << std::endl; return -6; }
-    if (fm1_frst >= frames1) { std::cout << errors_table[6] << std::endl; return 0; }
-    if (fm2_frst >= frames2) { std::cout << errors_table[6] << std::endl; return 0; }
-
-    if (fm1_cntr < 0) {
-        fm1_cntr = frames;
-    } else {
-        int32_t last = (std::min)(fm1_frst + (fm1_cntr-1)*fm1_step + 1, frames1);
-        fm1_cntr = (last - fm1_frst - 1)/fm1_step + 1;
-    }
-
-    if (fm2_cntr < 0) {
-        fm2_cntr = frames;
-    } else {
-        int32_t last = (std::min)(fm2_frst + (fm2_cntr-1)*fm2_step + 1, frames2);
-        fm2_cntr = (last - fm2_frst - 1)/fm2_step + 1;
-    }
-
-    if (seek_num1 > 0) {
-        if((seek_from1 < 1 || seek_from1 > reader1->GetFramesCount()) || (seek_to1 < 0 || seek_to1 >= reader1->GetFramesCount())) {
-            seek_num1 = 0;
-            std::cout << errors_table[12] << std::endl;
-        }
-    }
-    if (seek_num2 > 0) {
-        if((seek_from2 < 1 || seek_from2 > reader2->GetFramesCount()) || (seek_to2 < 0 || seek_to2 >= reader2->GetFramesCount())) {
-            seek_num2 = 0;
-            std::cout << errors_table[12] << std::endl;
-        }
-    }
-
-    if (seek_num1 > 0) {
-        fm1_cntr = (seek_from1 - seek_to1) * (seek_num1 + 1);
-        fm1_frst = seek_to1;
-        if (seek_num2 == 0) {
-            fm2_cntr = reader2->GetFramesCount();
-        }
-    }
-    if (seek_num2 > 0) {
-        fm2_cntr = (seek_from2 - seek_to2) * (seek_num2 + 1);
-        fm2_frst = seek_to2;
-        if (seek_num1 == 0) {
-            fm1_cntr = reader1->GetFramesCount();
-        }
-    }
-
-    const int32_t fm_count = std::min(fm1_cntr, fm2_cntr);
+    if (seek_to1 >= 0) fm1_frst = seek_to1;
+    if (seek_to2 >= 0) fm2_frst = seek_to2;
 
 #if !defined(NO_IPP)
     ippInit();
 #endif
 
-    std::vector < std::string >            metric_names;            // metric names
+    std::vector < std::string >            metric_names;    // metric names
     std::vector < bool >                   out_flags;
-    std::vector < double >                 avg_values;              // average per-sequence metric data
-    std::vector < std::vector < double > > all_values ( fm_count ); // perframe metric data
+    std::vector < double >                 avg_values;      // average per-sequence metric data
+    std::vector < std::vector < double > > all_values;      // perframe metric data
     uint32_t                               all_metrics;
     double                                 norm;
-
-    std::vector< CMetricEvaluator* > mevs;
+    std::vector< CMetricEvaluator* >       mevs;
 
     all_metrics = cmps[0].second | cmps[1].second | cmps[2].second | cmps[3].second;
 
@@ -1600,16 +1818,34 @@ int32_t main(int32_t argc, char** argv)
     for (i = 0; i < (int)mevs.size(); i++) {
         mevs[i]->InitFrameParams(reader1, reader2);
         mevs[i]->InitComputationParams(cmps, metric_names, out_flags, avg_values);
-        err = mevs[i]->AllocateResourses();
-        if ( err == -2 ) { std::cout << errors_table[13] << std::endl; return -13; }
+        err = mevs[i]->AllocateResourses(); if (err) return failure(err);
     }
 
-    for (i = 0; i < fm_count; i++, fm1_frst+=fm1_step, fm2_frst+=fm2_step) {
-        if(fm1_frst == seek_from1) { fm1_frst = seek_to1; }
-        if(fm2_frst == seek_from2) { fm2_frst = seek_to2; }
-        reader1->ReadRawFrame(fm1_frst); reader2->ReadRawFrame(fm2_frst);
-        for (j = 0; j < (int)mevs.size(); j++) mevs[j]->ComputeMetrics(all_values[i],avg_values);
+    bool bFrame1 = reader1->ReadRawFrame(fm1_frst);
+    bool bFrame2 = reader2->ReadRawFrame(fm2_frst);
+
+    if (!bFrame1) return failure(MCL_ERR_VIDEO1_FAIL);
+    if (!bFrame2) return failure(MCL_ERR_VIDEO2_FAIL);
+
+    std::vector < double > pfm_data;
+    while (bFrame1 && bFrame2) {
+        pfm_data.clear();
+        for (j = 0; j < (int)mevs.size(); j++) mevs[j]->ComputeMetrics(pfm_data, avg_values);
+        all_values.push_back(pfm_data);
+
+        if ((fm1_cntr == 1)|| (fm2_cntr == 1)) break;
+        if (fm1_cntr > 0) fm1_cntr--;
+        if (fm2_cntr > 0) fm2_cntr--;
+
+        fm1_frst += fm1_step; fm2_frst += fm2_step;
+
+        if (fm1_frst == seek_from1) { fm1_frst = seek_to1; seek_num1--; if (seek_num1<0) break; }
+        if (fm2_frst == seek_from2) { fm2_frst = seek_to2; seek_num2--; if (seek_num2<0) break; }
+        
+        bFrame1 = reader1->ReadRawFrame(fm1_frst);
+        bFrame2 = reader2->ReadRawFrame(fm2_frst);
     }
+    int fm_count = (int)all_values.size();
 
     for (i = 0; i < (int)mevs.size(); i++) delete mevs[i];
     delete reader1;
