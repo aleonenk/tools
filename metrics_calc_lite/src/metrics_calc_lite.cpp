@@ -186,7 +186,7 @@ public:
             mclRShiftC_C1IR(m_RShift, m_planes[2].data, m_planes[2].step, m_planes[2].roi, m_bd);
             mclRShiftC_C1IR(m_RShift, m_planes[3].data, m_planes[3].step, m_planes[3].roi, m_bd);
             m_cur_frame = (int32_t)field;
-        } 
+        }
         return true;
     };
 
@@ -268,6 +268,7 @@ public:
                         break;
                     case NV12P:
                     case NV12I:
+                    default:
                         m_planes[0].data = mclMalloc(m_Meta.step, bd);
                         if (!m_planes[0].data) return MCL_ERR_MEMORY_ALLOC;
                         m_planes[2].data = m_planes[0].data + m_planes[0].roi.height*m_planes[0].step;
@@ -300,6 +301,7 @@ public:
                     case YUY2I:
                     case NV16P:
                     case NV16I:
+                    default:
                         m_planes[0].data = mclMalloc(m_Meta.step, bd);
                         if (!m_planes[0].data) return MCL_ERR_MEMORY_ALLOC;
                         m_planes[1].data = m_planes[0].data + m_planes[0].roi.height*m_planes[0].step;
@@ -345,6 +347,7 @@ public:
                         break;
                     case Y410P:
                     case Y410I:
+                    default:
                         m_planes[0].data = mclMalloc(m_Meta.step, bd);
                         if (!m_planes[0].data) return MCL_ERR_MEMORY_ALLOC;
                         m_planes[1].data = m_planes[0].data + m_planes[0].roi.height*m_planes[0].step;
@@ -423,11 +426,56 @@ public:
 };
 
 #ifndef NO_MSDK
+#ifdef __linux__
+#include <unistd.h>
+#include <fcntl.h>
+
+#include "va/va.h"
+#include "va/va_drm.h"
+
+mfxStatus va_to_mfx_status(VAStatus va_res)
+{
+    mfxStatus mfxRes = MFX_ERR_NONE;
+
+    switch (va_res) {
+    case VA_STATUS_SUCCESS:
+        mfxRes = MFX_ERR_NONE;
+        break;
+    case VA_STATUS_ERROR_ALLOCATION_FAILED:
+        mfxRes = MFX_ERR_MEMORY_ALLOC;
+        break;
+    case VA_STATUS_ERROR_ATTR_NOT_SUPPORTED:
+    case VA_STATUS_ERROR_UNSUPPORTED_PROFILE:
+    case VA_STATUS_ERROR_UNSUPPORTED_ENTRYPOINT:
+    case VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT:
+    case VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE:
+    case VA_STATUS_ERROR_FLAG_NOT_SUPPORTED:
+    case VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED:
+        mfxRes = MFX_ERR_UNSUPPORTED;
+        break;
+    case VA_STATUS_ERROR_INVALID_DISPLAY:
+    case VA_STATUS_ERROR_INVALID_CONFIG:
+    case VA_STATUS_ERROR_INVALID_CONTEXT:
+    case VA_STATUS_ERROR_INVALID_SURFACE:
+    case VA_STATUS_ERROR_INVALID_BUFFER:
+    case VA_STATUS_ERROR_INVALID_IMAGE:
+    case VA_STATUS_ERROR_INVALID_SUBPICTURE:
+        mfxRes = MFX_ERR_NOT_INITIALIZED;
+        break;
+    case VA_STATUS_ERROR_INVALID_PARAMETER:
+        mfxRes = MFX_ERR_INVALID_VIDEO_PARAM;
+    default:
+        mfxRes = MFX_ERR_UNKNOWN;
+        break;
+    }
+    return mfxRes;
+}
+#endif
 class CMSDKReader : public CReader {
 private:
     SImage     m_Meta;
     SImage     m_planes[4]; /* YUV order */
-    
+
     mfxStatus          m_sts;
     MFXVideoSession    m_session;
     MFXVideoDECODE    *m_pDec;
@@ -436,7 +484,10 @@ private:
     mfxU8             *m_surfaceBuffers;
     mfxFrameSurface1 **m_pmfxSurfaces;
     mfxU16             m_numSurfaces;
-
+#ifdef __linux__
+    VADisplay          m_va_dpy;
+    int                m_fd;
+#endif
 protected:
     mfxStatus ReadBitStreamData(mfxBitstream* pBS, FILE* fSource)
     {
@@ -454,7 +505,55 @@ protected:
 
         return MFX_ERR_NONE;
     }
+#ifdef __linux__
+    mfxStatus CreateVAEnvDRM(mfxHDL* displayHandle)
+    {
+        VAStatus va_res = VA_STATUS_SUCCESS;
+        mfxStatus sts = MFX_ERR_NONE;
+        int major_version = 0, minor_version = 0;
 
+        m_fd = open("/dev/dri/renderD128", O_RDWR);
+        if (m_fd < 0) sts = MFX_ERR_NOT_INITIALIZED;
+
+        if (MFX_ERR_NONE == sts) {
+            m_va_dpy = vaGetDisplayDRM(m_fd);
+
+            *displayHandle = m_va_dpy;
+
+            if (!m_va_dpy) {
+                close(m_fd);
+                sts = MFX_ERR_NULL_PTR;
+            }
+        }
+        if(sts == MFX_ERR_NULL_PTR) {
+            m_fd = open("/dev/dri/card0", O_RDWR);
+            if (m_fd < 0) sts = MFX_ERR_NOT_INITIALIZED;
+
+            if (MFX_ERR_NONE == sts) {
+                m_va_dpy = vaGetDisplayDRM(m_fd);
+
+                *displayHandle = m_va_dpy;
+
+                if (!m_va_dpy) {
+                    close(m_fd);
+                    sts = MFX_ERR_NULL_PTR;
+                }
+            }
+        }
+        if (MFX_ERR_NONE == sts) {
+            va_res = vaInitialize(m_va_dpy, &major_version, &minor_version);
+            sts = va_to_mfx_status(va_res);
+            if (MFX_ERR_NONE != sts) {
+                close(m_fd);
+                m_fd = -1;
+            }
+        }
+        if (MFX_ERR_NONE != sts)
+            throw std::bad_alloc();
+
+        return sts;
+    }
+#endif
 public:
     CMSDKReader() {
         memset(&m_Meta, 0, sizeof(m_Meta));
@@ -466,8 +565,12 @@ public:
         m_pmfxSurfaces = NULL;
         m_numSurfaces = 0;
         memset(&m_mfxBS, 0, sizeof(m_mfxBS));
-        m_mfxBS.MaxLength = 1024 * 1024;
+        m_mfxBS.MaxLength = 8 * 1024 * 1024;
         m_mfxBS.Data = new mfxU8[m_mfxBS.MaxLength];
+#ifdef __linux__
+        m_va_dpy = NULL;
+        m_fd = -1;
+#endif
     };
 
     virtual ~CMSDKReader() {
@@ -476,20 +579,19 @@ public:
                 mclFree(m_Meta.data);
                 m_planes[0].data = 0;
             }
+        } else {
+            if (m_Meta.data) mclFree(m_Meta.data);
+            if (m_planes[0].data) mclFree(m_planes[0].data);
         }
-        else {
-            if (m_Meta.data) {
-                mclFree(m_Meta.data);
-            }
-            if (m_planes[0].data) {
-                mclFree(m_planes[0].data);
-            }
-        }
-
-        m_pDec->Close();
-        if (m_pDec) delete m_pDec;
+        if (m_pDec) { m_pDec->Close(); delete m_pDec;}
+        m_session.Close();
+#ifdef __linux__
+        if (m_va_dpy) vaTerminate(m_va_dpy);
+        if (m_fd >= 0) close(m_fd);
+#endif
         if (m_surfaceBuffers) delete[] m_surfaceBuffers;
-        for (int i = 0; i < m_numSurfaces; i++) if(m_pmfxSurfaces[i]) delete m_pmfxSurfaces[i];
+        for (int i = 0; i < m_numSurfaces; i++)
+            if(m_pmfxSurfaces[i]) delete m_pmfxSurfaces[i];
         if (m_pmfxSurfaces) delete[] m_pmfxSurfaces;
 
         delete[] m_mfxBS.Data;
@@ -501,19 +603,30 @@ public:
             if (m_planes[0].data != m_Meta.data) mclFree(m_planes[0].data);
         }
 
-        mfxVersion ver = { {0, 1} };
-        m_sts = m_session.Init(MFX_IMPL_AUTO_ANY, &ver);
+        mfxInitParam initPar;
+        memset(&initPar, 0, sizeof(initPar));
+        initPar.Version.Major = 1;
+        initPar.Version.Minor = 0;
+        initPar.Implementation = MFX_IMPL_AUTO_ANY;
+        m_sts = m_session.InitEx(initPar);
+        if (m_sts != MFX_ERR_NONE) return MCL_ERR_UNKNOWN;
+#ifdef __linux__
+        mfxHDL displayHandle = { 0 };
+        m_sts = CreateVAEnvDRM(&displayHandle);
         if (m_sts != MFX_ERR_NONE) return MCL_ERR_UNKNOWN;
 
+        m_sts = m_session.SetHandle(static_cast < mfxHandleType >(MFX_HANDLE_VA_DISPLAY), displayHandle);
+        if (m_sts != MFX_ERR_NONE) return MCL_ERR_UNKNOWN;
+#endif
         m_pDec = new MFXVideoDECODE(m_session);
         if (m_pDec == NULL) return MCL_ERR_MEMORY_ALLOC;
 
         bool isCodecDetected = false;
         memset(&m_mfxVideoParams, 0, sizeof(m_mfxVideoParams));
         m_mfxVideoParams.IOPattern = MFX_IOPATTERN_OUT_SYSTEM_MEMORY;
-        const mfxU32 CodecIds[] = { MFX_CODEC_HEVC, MFX_CODEC_AVC};
+        const mfxU32 CodecIds[] = { MFX_CODEC_AVC, MFX_CODEC_HEVC };
 
-        for(int cid = 0; cid < sizeof(CodecIds); cid++) {
+        for(int cid = 0; cid < (int)sizeof(CodecIds); cid++) {
             if (m_file) fclose(m_file);
             if (NULL == (m_file = fopen(name.c_str(), "rb"))) return MCL_ERR_INVALID_PARAM;
             m_mfxBS.DataOffset = m_mfxBS.DataLength = 0;
@@ -538,8 +651,8 @@ public:
         memset(&Request, 0, sizeof(Request));
         m_sts = m_pDec->QueryIOSurf(&m_mfxVideoParams, &Request);
         if (m_sts != MFX_ERR_NONE && m_sts != MFX_WRN_PARTIAL_ACCELERATION)
-            return MCL_ERR_UNKNOWN;
-        
+            return MCL_ERR_MEMORY_ALLOC;
+
         switch (Request.Info.FourCC) {
         case MFX_FOURCC_NV12:
         case MFX_FOURCC_P010:
@@ -571,7 +684,7 @@ public:
         mfxU32 surfaceSize = 3 * width * height;
 
         if (bd == 8) surfaceSize >>= 1;
-        
+
         m_numSurfaces = Request.NumFrameSuggested;
         m_surfaceBuffers = (mfxU8*) new mfxU8[surfaceSize * m_numSurfaces];
         m_pmfxSurfaces = new mfxFrameSurface1 *[m_numSurfaces];
@@ -810,7 +923,7 @@ private:
     }
 
 public:
-    CSSIMEvaluator(): m_ssim_c1(0), m_ssim_c2(0), m_step(0) {
+    CSSIMEvaluator(): m_step(0), m_ssim_c1(0), m_ssim_c2(0) {
         std::pair< std::string, std::pair<uint32_t, uint32_t> >   metric_pair;
         metric_pair.first = "SSIM"; metric_pair.second.first = MASK_SSIM; metric_pair.second.second = MASK_SSIM; metrics.push_back(metric_pair);
         m_mu1 = m_mu2 = m_mu1_sq = m_mu2_sq = m_mu1_mu2 = m_tmp = 0;
@@ -858,7 +971,7 @@ public:
         float max_e = (float)MaxError(m_i1->GetBitDepth());
         m_ssim_c1 = 0.0001f*max_e*max_e;
         m_ssim_c2 = 0.0009f*max_e*max_e;
-        
+
         return MCL_ERR_NONE;
     };
 
@@ -1049,7 +1162,7 @@ private:
             Ipp32f  t1, t2, t3, t4, *pMx, *pMy, *pSx2, *pSy2, *pSxy;
             Ipp64f  tmp;
             pMx = pTmp[0]; pMy = pTmp[1]; pSx2 = pTmp[2]; pSy2 = pTmp[3]; pSxy = pTmp[4];
-            
+
             for (j = 0; j<o_roi.width; j++) {
                 t1 = (*pMx)*(*pMy); t1 = t1 + t1 + C1;
                 t2 = (*pSxy) + (*pSxy) - t1 + C2;
@@ -1062,7 +1175,7 @@ private:
                 if (tmp < artifacts_threshold) (artf)++;
                 pMx++; pMy++; pSx2++; pSy2++; pSxy++;
             }
-            
+
             pSrc1 = (Ipp32f*)((Ipp8u*)pSrc1 + srcStep);
             pSrc2 = (Ipp32f*)((Ipp8u*)pSrc2 + srcStep);
 
@@ -1480,7 +1593,7 @@ public:
 };
 #endif
 
-static const char *error_msg[] = 
+static const char *error_msg[] =
 {
     "",
     "Unable to parse commandline options.",
@@ -1710,7 +1823,7 @@ int32_t main(int32_t argc, char** argv)
                 if (sq2_type == UNKNOWN) { sq2_type = sq1_type; }
                 else                     { cur_param++; }
             }
-        } else 
+        } else
             break;
     }
 
@@ -1757,9 +1870,9 @@ int32_t main(int32_t argc, char** argv)
 
     if (is_interlaced(sq1_type) != is_interlaced(sq2_type)) return failure(MCL_ERR_INCOMPATIBLE_VIDEO, "Can't compare progressive and interlaced sequences!");
     if (is_rgb(sq1_type) != is_rgb(sq2_type)) return failure(MCL_ERR_INCOMPATIBLE_VIDEO, "Can't compare YUV and RGB sequences!");
-    
-    if (err = parse_metrics(cmps, argc, argv, cur_param)) return failure(err);
-    
+
+    if ((err = parse_metrics(cmps, argc, argv, cur_param))) return failure(err);
+
     char all_metrics_mask = 0;
     for (size_t i = 0; i < cmps.size(); i++) all_metrics_mask |= cmps[i].second;
     if (!all_metrics_mask) return failure(MCL_ERR_EMPTY_METRICSET);
@@ -1841,7 +1954,7 @@ int32_t main(int32_t argc, char** argv)
 
         if (fm1_frst == seek_from1) { fm1_frst = seek_to1; seek_num1--; if (seek_num1<0) break; }
         if (fm2_frst == seek_from2) { fm2_frst = seek_to2; seek_num2--; if (seek_num2<0) break; }
-        
+
         bFrame1 = reader1->ReadRawFrame(fm1_frst);
         bFrame2 = reader2->ReadRawFrame(fm2_frst);
     }
